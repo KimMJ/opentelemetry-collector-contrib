@@ -680,6 +680,18 @@ func concatDimensionValue(dest *bytes.Buffer, value string, prefixSep bool) {
 	dest.WriteString(value)
 }
 
+// concatDimensionPair writes prefixSep?+name+':'+value straight into dest, producing
+// the same bytes as concatDimensionValue(dest, name+":"+value, prefixSep) without
+// building that intermediate "name:value" string.
+func concatDimensionPair(dest *bytes.Buffer, name, value string, prefixSep bool) {
+	if prefixSep {
+		dest.WriteString(metricKeySeparator)
+	}
+	dest.WriteString(name)
+	dest.WriteByte(':')
+	dest.WriteString(value)
+}
+
 // buildKey builds the metric key from the service name and span metadata such as name, kind, status_code and
 // will attempt to add any additional dimensions the user has configured that match the span's attributes
 // or resource/event attributes. If the dimension exists in both, the span's attributes, being the most specific, takes precedence.
@@ -711,10 +723,10 @@ func (p *connectorImp) buildKey(serviceName string, span ptrace.Span, dimensions
 	}
 
 	matchDimensions(dimensions, span, resourceOrEventAttrs, func(n string, v pcommon.Value) {
-		concatDimensionValue(p.keyBuf, n+":"+v.AsString(), true)
+		concatDimensionPair(p.keyBuf, n, v.AsString(), true)
 	})
 	matchDimensions(optionalDims, span, resourceOrEventAttrs, func(n string, v pcommon.Value) {
-		concatDimensionValue(p.keyBuf, n+":"+v.AsString(), true)
+		concatDimensionPair(p.keyBuf, n, v.AsString(), true)
 	})
 
 	if p.config.EnableMetricsSamplingMethod {
