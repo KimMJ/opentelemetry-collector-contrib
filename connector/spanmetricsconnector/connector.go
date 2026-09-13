@@ -284,6 +284,10 @@ func (*connectorImp) Capabilities() consumer.Capabilities {
 // ConsumeTraces implements the consumer.Traces interface.
 // It aggregates the trace data to generate metrics.
 func (p *connectorImp) ConsumeTraces(_ context.Context, traces ptrace.Traces) error {
+	// SPIKE: option A switch for benchmarks.
+	if spikePreAgg && !p.config.Exemplars.Enabled && !p.events.Enabled {
+		return p.consumeTracesPreAgg(traces)
+	}
 	p.lock.Lock()
 	p.aggregateMetrics(traces)
 	p.lock.Unlock()
