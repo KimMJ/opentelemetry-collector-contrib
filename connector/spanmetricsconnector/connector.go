@@ -63,7 +63,10 @@ type dimensionList struct {
 }
 
 type connectorImp struct {
-	lock   sync.Mutex
+	lock sync.Mutex
+	// SPIKE: flushLock serializes snapshot flushes, whose pdata build (and lastDeltaTimestamps
+	// access) runs outside p.lock. Never taken by ConsumeTraces.
+	flushLock sync.Mutex
 	logger *zap.Logger
 	config Config
 
@@ -367,6 +370,113 @@ func (p *connectorImp) buildMetrics() pmetric.Metrics {
 		}
 	})
 
+	return m
+}
+
+// SPIKE: snapshot-based flush. Only a plain-value snapshot + resetState run under p.lock;
+// pdata construction happens outside.
+
+type resourceSnapshot struct {
+	// attributes is the resource attribute map captured by getOrCreateResourceMetrics
+	// (the caller's map, not a copy). Only read.
+	attributes pcommon.Map
+	sums       []metrics.SumPoint
+	histograms metrics.HistogramSnapshot
+	events     []metrics.SumPoint
+}
+
+// exportMetricsSnapshot is the snapshot counterpart of exportMetrics.
+func (p *connectorImp) exportMetricsSnapshot(ctx context.Context) {
+	m := p.flushSnapshot()
+	if err := p.metricsConsumer.ConsumeMetrics(ctx, m); err != nil {
+		p.logger.Error("Failed ConsumeMetrics", zap.Error(err))
+	}
+}
+
+func (p *connectorImp) flushSnapshot() pmetric.Metrics {
+	p.flushLock.Lock()
+	defer p.flushLock.Unlock()
+	p.lock.Lock()
+	timestamp, snaps := p.snapshotLocked()
+	p.resetState()
+	p.lock.Unlock()
+	return p.buildMetricsFromSnapshot(timestamp, snaps)
+}
+
+// snapshotLocked must be called with p.lock held.
+func (p *connectorImp) snapshotLocked() (pcommon.Timestamp, []resourceSnapshot) {
+	timestamp := pcommon.NewTimestampFromTime(p.clock.Now())
+	temporality := p.config.GetAggregationTemporality()
+	withExemplars := p.config.Exemplars.Enabled
+	snaps := make([]resourceSnapshot, 0, p.resourceMetrics.Len())
+	p.resourceMetrics.ForEach(func(_ resourceKey, rawMetrics *resourceMetrics) {
+		rs := resourceSnapshot{attributes: rawMetrics.attributes}
+		rs.sums = rawMetrics.sums.Snapshot(nil, temporality, withExemplars)
+		if !p.config.Histogram.Disable {
+			rs.histograms = rawMetrics.histograms.Snapshot(withExemplars)
+		}
+		if p.events.Enabled {
+			rs.events = rawMetrics.events.Snapshot(nil, temporality, withExemplars)
+		}
+		snaps = append(snaps, rs)
+	})
+	return timestamp, snaps
+}
+
+// buildMetricsFromSnapshot runs without p.lock (under p.flushLock). It is the only user of
+// p.lastDeltaTimestamps on this path.
+func (p *connectorImp) buildMetricsFromSnapshot(timestamp pcommon.Timestamp, snaps []resourceSnapshot) pmetric.Metrics {
+	m := pmetric.NewMetrics()
+	temporality := p.config.GetAggregationTemporality()
+	isDelta := temporality == pmetric.AggregationTemporalityDelta
+	includeResource := !metadata.ConnectorSpanmetricsExcludeResourceMetricsFeatureGate.IsEnabled() || p.config.AddResourceAttributes
+	metricsNamespace := p.config.Namespace
+	if metadata.ConnectorSpanmetricsLegacyMetricNamesFeatureGate.IsEnabled() && metricsNamespace == DefaultNamespace {
+		metricsNamespace = ""
+	}
+
+	m.ResourceMetrics().EnsureCapacity(len(snaps))
+	for i := range snaps {
+		rs := &snaps[i]
+		rm := m.ResourceMetrics().AppendEmpty()
+		if includeResource {
+			rs.attributes.CopyTo(rm.Resource().Attributes())
+		}
+		sm := rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("spanmetricsconnector")
+
+		deltaMetricKeys := make(map[metrics.Key]bool)
+		timeStampGenerator := func(mk metrics.Key, startTime pcommon.Timestamp) pcommon.Timestamp {
+			if isDelta {
+				if lastTimestamp, ok := p.lastDeltaTimestamps.Get(mk); ok {
+					startTime = lastTimestamp
+				}
+				deltaMetricKeys[mk] = true
+			}
+			return startTime
+		}
+
+		metric := sm.Metrics().AppendEmpty()
+		metric.SetName(buildMetricName(metricsNamespace, metricNameCalls))
+		metrics.BuildSumMetricsFromSnapshot(metric, rs.sums, timestamp, timeStampGenerator, temporality)
+
+		if !p.config.Histogram.Disable {
+			metric = sm.Metrics().AppendEmpty()
+			metric.SetName(buildMetricName(metricsNamespace, metricNameDuration))
+			metric.SetUnit(p.config.Histogram.Unit.String())
+			rs.histograms.BuildMetrics(metric, timestamp, timeStampGenerator, temporality)
+		}
+
+		if p.events.Enabled {
+			metric = sm.Metrics().AppendEmpty()
+			metric.SetName(buildMetricName(metricsNamespace, metricNameEvents))
+			metrics.BuildSumMetricsFromSnapshot(metric, rs.events, timestamp, timeStampGenerator, temporality)
+		}
+
+		for mk := range deltaMetricKeys {
+			p.lastDeltaTimestamps.Add(mk, timestamp)
+		}
+	}
 	return m
 }
 

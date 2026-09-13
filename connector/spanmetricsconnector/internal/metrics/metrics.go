@@ -22,6 +22,8 @@ type HistogramMetrics interface {
 	BuildMetrics(pmetric.Metric, pcommon.Timestamp, func(Key, pcommon.Timestamp) pcommon.Timestamp, pmetric.AggregationTemporality)
 	ClearExemplars()
 	ExpireSeries(expiration time.Duration, now time.Time)
+	// Snapshot copies the current values into a plain-Go snapshot. Must be called under the connector lock.
+	Snapshot(withExemplars bool) HistogramSnapshot
 }
 
 type Histogram interface {
